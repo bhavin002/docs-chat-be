@@ -3,17 +3,30 @@ const { OpenAI } = require('openai');
 const { encode } = require('gpt-tokenizer');
 const { Pinecone } = require('@pinecone-database/pinecone');
 const { RecursiveCharacterTextSplitter } = require('langchain/text_splitter');
+const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { ChatOpenAI } = require("@langchain/openai");
 const { PromptTemplate } = require("@langchain/core/prompts");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { chatWithDocument } = require('../util/prompt');
+const Joi = require('joi');
 
+const upsertDataValidation = Joi.object({
+    key: Joi.string().required()
+});
+
+const chatWithDocumentValidation = Joi.object({
+    query: Joi.string().required()
+});
 
 const openai = new OpenAI();
 const llm = new ChatOpenAI({
     model: "gpt-4",
     temperature: 0.1,
 })
+
+// Setup Pinecone
+const pinecone = new Pinecone({
+    apiKey: process.env.PINECONE_API_KEY
+});
 
 const client = new S3Client({
     region: process.env.AWS_REGION,
@@ -23,10 +36,7 @@ const client = new S3Client({
     },
 });
 
-// Setup Pinecone
-const pinecone = new Pinecone({
-    apiKey: process.env.PINECONE_API_KEY
-});
+
 const pineconeIndex = pinecone.Index(process.env.PINECONE_INDEX_NAME);
 
 async function splitTextIntoChunks(text, chunkSize = 4000, overlap = 200) {
@@ -107,6 +117,15 @@ async function storeEmbeddingsInPinecone(chunks, embeddings) {
     }
 }
 
+
+async function streamToBuffer(stream) {
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+}
+
 async function getFileFromS3(key) {
     const command = new GetObjectCommand({
         Bucket: process.env.S3_BUCKET_NAME,
@@ -117,52 +136,13 @@ async function getFileFromS3(key) {
     return await streamToBuffer(response.Body);
 }
 
-async function streamToBuffer(stream) {
-    const chunks = [];
-    for await (const chunk of stream) {
-        chunks.push(chunk);
-    }
-    return Buffer.concat(chunks);
-}
-
-exports.uploadPreSignedUrl = async (req, res) => {
-    const { file } = req.body; // Expecting a single file
-    if (!file) {
-        return res.status(400).json({ message: 'No file provided' });
-    }
-
-    try {
-        // Generate a pre-signed URL for the single file
-        const key = `${req.user.userId}/${file}`;
-        const command = new PutObjectCommand({
-            Bucket: process.env.BUCKET_NAME,
-            Key: key,
-        });
-        const url = await getSignedUrl(client, command, { expiresIn: 3600 });
-
-        res.status(200).json({
-            status: "success",
-            message: "Pre-signed URL generated successfully",
-            preSignedUrl: {
-                key,
-                URL: url
-            },
-        });
-    } catch (error) {
-        console.error('Error generating pre-signed URL:', error); // Log the error for debugging
-        res.status(500).json({ message: 'Server error' });
-    }
-};
-
-
 exports.upsertData = async (req, res) => {
     try {
 
-        const { key } = req.body;
+        const { error } = upsertDataValidation.validate(req.body);
+        if (error) return res.status(400).json({ message: error.details[0].message });
 
-        if (!key) {
-            return res.status(400).send('S3 bucket and key are required.');
-        }
+        const { key } = req.body;
 
         console.log('Retrieving PDF from S3...', key);
         const dataBuffer = await getFileFromS3(key);
@@ -191,6 +171,10 @@ exports.upsertData = async (req, res) => {
 }
 
 exports.chatWithDocument = async (req, res) => {
+
+    const { error } = chatWithDocumentValidation.validate(req.body);
+    if (error) return res.status(400).json({ message: error.details[0].message });
+
     const { query } = req.body;
 
     try {
