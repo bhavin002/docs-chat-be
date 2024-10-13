@@ -7,13 +7,16 @@ const { S3Client, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { ChatOpenAI } = require("@langchain/openai");
 const { PromptTemplate } = require("@langchain/core/prompts");
 const { chatWithDocument } = require('../util/prompt');
+const Chat = require('../models/chatModel');
 const Joi = require('joi');
 
 const upsertDataValidation = Joi.object({
-    key: Joi.string().required()
+    key: Joi.string().required(),
+    documentId: Joi.string().required()
 });
 
 const chatWithDocumentValidation = Joi.object({
+    documentId: Joi.string().required(),
     query: Joi.string().required()
 });
 
@@ -101,11 +104,11 @@ function chunkArray(array, chunkSize = 100) {
 }
 
 // Store embeddings in Pinecone using batch upserts
-async function storeEmbeddingsInPinecone(chunks, embeddings) {
+async function storeEmbeddingsInPinecone(chunks, embeddings, documentId) {
     const vectors = chunks.map((chunk, index) => ({
         id: `chunk-${index}`,
         values: embeddings[index],
-        metadata: { text: chunk },
+        metadata: { text: chunk, documentId: documentId },
     }));
 
     const batches = chunkArray(vectors, 100);
@@ -142,7 +145,7 @@ exports.upsertData = async (req, res) => {
         const { error } = upsertDataValidation.validate(req.body);
         if (error) return res.status(400).json({ message: error.details[0].message });
 
-        const { key } = req.body;
+        const { key, documentId } = req.body;
 
         console.log('Retrieving PDF from S3...', key);
         const dataBuffer = await getFileFromS3(key);
@@ -161,7 +164,7 @@ exports.upsertData = async (req, res) => {
         console.log('✌️embeddings --->', embeddings.length);
 
         // Store embeddings in Pinecone using batch upserts
-        await storeEmbeddingsInPinecone(chunks, embeddings);
+        await storeEmbeddingsInPinecone(chunks, embeddings, documentId);
 
         res.json({ message: 'PDF processed and stored successfully!' });
     } catch (error) {
@@ -175,7 +178,9 @@ exports.chatWithDocument = async (req, res) => {
     const { error } = chatWithDocumentValidation.validate(req.body);
     if (error) return res.status(400).json({ message: error.details[0].message });
 
-    const { query } = req.body;
+    const { query, documentId } = req.body;
+    console.log('✌️query --->', query);
+    console.log('✌️documentId --->', documentId);
 
     try {
         // Generate embedding for the user query
@@ -192,7 +197,9 @@ exports.chatWithDocument = async (req, res) => {
             topK: 5, // Adjust the number of results you want
             includeValues: true,
             includeMetadata: true,
+            filter: { documentId: documentId }
         });
+
         console.log('✌️queryResults --->', queryResults);
 
         // Extract and return the most relevant chunks
@@ -205,9 +212,28 @@ exports.chatWithDocument = async (req, res) => {
         const response = await chain.invoke({ context: results.join('\n'), question: query });
         console.log('✌️response --->', response);
 
-        res.json({ result: response.content });
+        const chat = new Chat({
+            query,
+            answer: response.content,
+            documentId
+        })
+
+        await chat.save();
+
+        res.json({ chat });
     } catch (error) {
         console.error('Error querying Pinecone:', error);
         res.status(500).json({ error: 'Failed to query the document' });
+    }
+}
+
+exports.getChatHistory = async (req, res) => {
+    try {
+        const chats = await Chat.find({ documentId: req.params.documentId }).sort({ createdAt: 1 });
+        console.log('✌️chats --->', chats);
+        res.json({ chats });
+    } catch (error) {
+        console.error('Error fetching chat history:', error);
+        res.status(500).json({ error: 'Failed to fetch chat history' });
     }
 }
