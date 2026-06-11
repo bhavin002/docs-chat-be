@@ -9,6 +9,9 @@ const { PromptTemplate } = require("@langchain/core/prompts");
 const { chatWithDocument } = require('../util/prompt');
 const Chat = require('../models/chatModel');
 const Joi = require('joi');
+const documentModel = require('../models/documentModel');
+const posthogClient = require('../util/posthogClient');
+
 
 const upsertDataValidation = Joi.object({
     key: Joi.string().required(),
@@ -174,15 +177,23 @@ exports.upsertData = async (req, res) => {
 }
 
 exports.chatWithDocument = async (req, res) => {
-
+    const startTime = Date.now(); // Start time tracking
+    console.log('✌️startTime --->', startTime);
     const { error } = chatWithDocumentValidation.validate(req.body);
     if (error) return res.status(400).json({ message: error.details[0].message });
 
     const { query, documentId } = req.body;
     console.log('✌️query --->', query);
     console.log('✌️documentId --->', documentId);
+    const document = await documentModel.findById(documentId);
+
+    if (!document) {
+        return res.status(404).json({ error: 'Document not found' });
+    }
+    console.log('✌️document --->', document);
 
     try {
+
         // Generate embedding for the user query
         const queryEmbeddingResponse = await openai.embeddings.create({
             model: 'text-embedding-ada-002',
@@ -194,7 +205,7 @@ exports.chatWithDocument = async (req, res) => {
         // Query Pinecone for the closest match
         const queryResults = await pineconeIndex.query({
             vector: queryEmbedding,
-            topK: 5, // Adjust the number of results you want
+            topK: 5,
             includeValues: true,
             includeMetadata: true,
             filter: { documentId: documentId }
@@ -207,7 +218,6 @@ exports.chatWithDocument = async (req, res) => {
         console.log('✌️results --->', results);
 
         const prompt = PromptTemplate.fromTemplate(chatWithDocument);
-
         const chain = prompt.pipe(llm);
         const response = await chain.invoke({ context: results.join('\n'), question: query });
         console.log('✌️response --->', response);
@@ -216,16 +226,45 @@ exports.chatWithDocument = async (req, res) => {
             query,
             answer: response.content,
             documentId
-        })
+        });
 
         await chat.save();
 
+        const endTime = Date.now();
+        const responseTime = (endTime - startTime) / 1000;
+
+        // Track response time in PostHog
+        if (posthogClient) {
+            await posthogClient.capture({
+                distinctId: req.user ? req.user.userId : 'anonymous',
+                event: 'chat_response_time',
+                properties:{
+                    response_time: responseTime,
+                    query,
+                    documentSize: (document.size / (1024 * 1024)).toFixed(2) + 'MB' // Convert to MB
+                }
+            });
+        }
+
         res.json({ chat });
+
     } catch (error) {
         console.error('Error querying Pinecone:', error);
+
+        // Track 500 error in PostHog
+        if (posthogClient) {
+            await posthogClient.capture({
+                distinct_id: req.user ? req.user.userId : 'anonymous',
+                event: 'api_error_500',
+                error_message: error.message,
+                query,
+                documentSize: (document.size / (1024 * 1024)).toFixed(2) + 'MB' // Convert to MB
+            });
+        }
+
         res.status(500).json({ error: 'Failed to query the document' });
     }
-}
+};
 
 exports.getChatHistory = async (req, res) => {
     try {
